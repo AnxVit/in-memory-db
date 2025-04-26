@@ -111,7 +111,7 @@ func (sf *ScalableCuckooFilter) Encode() []byte {
 	return buf.Bytes()
 }
 
-func (sf *ScalableCuckooFilter) DecodeWithParam(fBytes []byte, opts ...option) (*ScalableCuckooFilter, error) {
+func DecodeWithParam(fBytes []byte, opts ...option) (*ScalableCuckooFilter, error) {
 	instance, err := DecodeScalableFilter(fBytes)
 	if err != nil {
 		return nil, err
