@@ -1,8 +1,7 @@
 package main
 
 import (
-	"GoKeyValueWarehouse/sstable"
-	"GoKeyValueWarehouse/wal"
+	"GoKeyValueWarehouse/levels/sstable"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -15,8 +14,7 @@ type DB struct {
 	memtable     *memtable
 	memtableLock *sync.RWMutex // ?
 
-	sstables     []*sstable.SSTable
-	sstablesLock *sync.RWMutex // ?
+	lc *LevelsController
 
 	flushQueue     []*memtable
 	flushQueueLock *sync.Mutex
@@ -45,8 +43,6 @@ func Open(opts Options) (*DB, error) {
 	db := &DB{
 		memtableLock: &sync.RWMutex{},
 
-		sstablesLock: &sync.RWMutex{},
-
 		flushQueue:     make([]*memtable, 0),
 		flushQueueLock: &sync.Mutex{},
 
@@ -63,25 +59,20 @@ func Open(opts Options) (*DB, error) {
 		return nil, err
 	}
 
-	db.loadSSTables()
-
-	// open the write ahead log
-	wal, err := wal.Open(&db.opt.WALOpt)
+	db.lc, err = newLevelsController(db, &MetaSST{})
 	if err != nil {
 		return nil, err
 	}
 
-	db.wg.Add(1)
-	go db.backgroundWalWriter() // start the background wal writer
+	// db.wg.Add(1)
+	// go db.backgroundWalWriter() // start the background wal writer
 	// db.printLog("Background WAL writer started")
 
 	db.wg.Add(1)
-	go db.backgroundFlusher() // start the background flusher
-	// db.printLog("Background flusher started")
+	go db.flushMemtable(db.wg)
 
-	// Start the background compactor
 	db.wg.Add(1)
-	go db.backgroundCompactor() // start the background compactor
+	go db.startCompactions(db.wg) // start the background compactor
 	// db.printLog("Background compactor started")
 
 	//db.printLog("DB opened successfully")
@@ -96,7 +87,7 @@ func (db *DB) close() error {
 
 	if db.memtable.sl.Size() > 0 {
 		// db.printLog(fmt.Sprintf("Memtable is of size %d bytes and is being flushed to disk", db.memtable.Size()))
-		db.appendMemtableToFlushQueue()
+		// db.appendMemtableToFlushQueue()
 	}
 
 	// signal the background operations to exit
@@ -109,12 +100,12 @@ func (db *DB) close() error {
 	// db.printLog("Background operations finished")
 	// db.printLog("Closing SSTables")
 
-	for _, sstable := range db.sstables {
-		err := sstable.Close()
-		if err != nil {
-			return err
-		}
-	}
+	// for _, sstable := range db.sstables {
+	// 	err := sstable.Close()
+	// 	if err != nil {
+	// 		return err
+	// 	}
+	// }
 	// db.printLog("SSTables closed")
 	if db.memtable.wal != nil {
 		// db.printLog("Closing WAL")
@@ -151,7 +142,6 @@ func (db *DB) checkFlushQueue() error {
 
 	select {
 	case db.flushQueueChan <- db.memtable:
-
 		db.flushQueue = append(db.flushQueue, db.memtable)
 		db.memtable, err = db.newMemtable()
 		if err != nil {
@@ -164,8 +154,8 @@ func (db *DB) checkFlushQueue() error {
 	}
 }
 
-func (db *DB) flushMemtable(lc *sync.WaitGroup) {
-	defer lc.Done()
+func (db *DB) flushMemtable(wg *sync.WaitGroup) {
+	defer wg.Done()
 
 	for mt := range db.flushQueueChan {
 		if mt == nil {
@@ -178,20 +168,29 @@ func (db *DB) flushMemtable(lc *sync.WaitGroup) {
 				continue
 			}
 
-			// Update s.imm. Need a lock.
 			db.lock.Lock()
-
 			db.flushQueue = db.flushQueue[1:]
-			mt.DecrRef() // Return memory.
-			// unlock
+			// mt.DecrRef() // Return memory.
 			db.lock.Unlock()
 			break
 		}
 	}
 }
 
-func (db *DB) flushMemtableToDisk(mt *memtable) error {
+func (db *DB) startCompactions(wg *sync.WaitGroup) {
+	defer wg.Done()
+	db.lc.startCompact()
+}
 
+func (db *DB) flushMemtableToDisk(mt *memtable) error {
+	// TODO: change code
+	data := getEntryFromMemtable(mt)
+	fileID := db.lc.getNextFileID()
+	tbl, err := sstable.CreateTable(fileID, data, db.opt.SSTableOpt)
+	if err != nil {
+		return errors.WithMessage(err, "could not flush memtable to disk")
+	}
+	return db.lc.addLevel0Table(tbl)
 }
 
 func (db *DB) getMemTables() ([]*memtable, func()) {
@@ -200,18 +199,18 @@ func (db *DB) getMemTables() ([]*memtable, func()) {
 
 	var tables []*memtable
 	tables = append(tables, db.memtable)
-	db.memtable.IncrRef()
+	// db.memtable.IncrRef()
 
 	// Get immutable memtables.
 	last := len(db.flushQueue) - 1
 	for i := range db.flushQueue {
 		tables = append(tables, db.flushQueue[last-i])
-		db.flushQueue[last-i].IncrRef()
+		// db.flushQueue[last-i].IncrRef()
 	}
 	return tables, func() {
-		for _, tbl := range tables {
-			tbl.DecrRef()
-		}
+		// for _, tbl := range tables {
+		// 		tbl.DecrRef()
+		// }
 	}
 }
 
@@ -228,5 +227,7 @@ func (db *DB) get(key []byte) (interface{}, error) {
 			return val, nil
 		}
 	}
-	return db.lc.get(key, 0)
+	return db.lc.get(key)
 }
+
+// TODO: dropAll

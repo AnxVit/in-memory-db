@@ -10,38 +10,40 @@ type BlockIndex struct {
 	key    []byte
 	offset int64
 	size   int64
+	data   []Entry
 }
 
-func (sst *SSTable) RebuildBlockIndexFromFile(blockSize int) ([]BlockIndex, error) {
-	defer func() {
-		sst.File.Seek(0, io.SeekStart)
+func (sst *SSTable) rebuildBlockIndexFromFile() <-chan BlockIndex {
+	out := make(chan BlockIndex)
+	go func() {
+		defer close(out)
+
+		var currentOffset int64 = 0
+		for {
+			entries, nextOffset, err := readEntries(sst.File, currentOffset, int(sst.opt.BlockSize))
+			if err != nil {
+				// TODO: error
+				return
+			}
+			if len(entries) == 0 {
+				break
+			}
+
+			out <- BlockIndex{
+				key:    entries[0].Key,
+				offset: currentOffset,
+				size:   nextOffset - currentOffset,
+				data:   entries,
+			}
+
+			currentOffset = nextOffset
+		}
 	}()
 
-	var index []BlockIndex
-	var currentOffset int64 = 0
-
-	for {
-		key, nextOffset, err := readEntries(sst.File, currentOffset, blockSize)
-		if err != nil {
-			return nil, err
-		}
-		if key == nil {
-			break
-		}
-
-		index = append(index, BlockIndex{
-			key:    key,
-			offset: currentOffset,
-			size:   nextOffset - currentOffset,
-		})
-
-		currentOffset = nextOffset
-	}
-
-	return index, nil
+	return out
 }
 
-func readEntries(file *os.File, offset int64, blockSize int) ([]byte, int64, error) {
+func readEntries(file *os.File, offset int64, blockSize int) ([]Entry, int64, error) {
 	info, _ := file.Stat()
 	size := info.Size()
 
@@ -49,7 +51,7 @@ func readEntries(file *os.File, offset int64, blockSize int) ([]byte, int64, err
 
 	var err error
 
-	keys := make([][]byte, 0)
+	entries := make([]Entry, 0)
 
 	for (currentOffset - offset) < int64(blockSize) {
 		var keyLen int32
@@ -59,12 +61,10 @@ func readEntries(file *os.File, offset int64, blockSize int) ([]byte, int64, err
 		if keyLen < 0 || keyLen > int32(size) {
 			break
 		}
-
 		key := make([]byte, keyLen)
 		if err = binary.Read(file, binary.LittleEndian, &key); err != nil {
 			break
 		}
-		keys = append(keys, key)
 
 		var valueLen int32
 		if err = binary.Read(file, binary.LittleEndian, &valueLen); err != nil {
@@ -78,6 +78,11 @@ func readEntries(file *os.File, offset int64, blockSize int) ([]byte, int64, err
 			break
 		}
 
+		entries = append(entries, Entry{
+			Key:   key,
+			Value: value,
+		})
+
 		currentOffset, _ = file.Seek(0, io.SeekCurrent)
 	}
 
@@ -87,8 +92,8 @@ func readEntries(file *os.File, offset int64, blockSize int) ([]byte, int64, err
 		return nil, 0, err
 	}
 
-	if len(keys) == 0 {
+	if len(entries) == 0 {
 		return nil, 0, nil
 	}
-	return keys[0], currentOffset, nil
+	return entries, currentOffset, nil
 }

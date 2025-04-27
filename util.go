@@ -1,6 +1,7 @@
 package main
 
 import (
+	"GoKeyValueWarehouse/levels/sstable"
 	"GoKeyValueWarehouse/operation"
 	"bytes"
 	"encoding/binary"
@@ -39,4 +40,8 @@ func ParseTs(key []byte) uint64 {
 		return 0
 	}
 	return math.MaxUint64 - binary.BigEndian.Uint64(key[len(key)-8:])
+}
+
+func getEntryFromMemtable(mt *memtable) []sstable.Entry {
+	return []sstable.Entry{}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -32,15 +33,36 @@ type SSTable struct {
 
 	// ref atomic.Int32 // For file garbage collection
 
+	// index
 	blockIndex        []BlockIndex
 	blockCache        *lru.Cache[int64, []Entry]
 	smallest, biggest []byte
 
+	// sstable inforamtion
 	id        uint64
 	CreatedAt time.Time
-	tableSize int
+	tableSize int64
 
+	// filter
 	filter *adaptivefilter.ScalableCuckooFilter
+
+	wg *sync.WaitGroup
+}
+
+func (sst *SSTable) GetID() uint64 {
+	return sst.id
+}
+
+func (sst *SSTable) GetSmallest() []byte {
+	return sst.smallest
+}
+
+func (sst *SSTable) GetSize() int64 {
+	return sst.tableSize
+}
+
+func TableName(id uint64, dir string) string {
+	return filepath.Join(dir, IDToFilename(id))
 }
 
 func CreateTable(id uint64, entries []Entry, opt Options) (*SSTable, error) {
@@ -78,7 +100,7 @@ func CreateTable(id uint64, entries []Entry, opt Options) (*SSTable, error) {
 	sst.writeData(entries)
 
 	fileInfo, _ := sst.File.Stat()
-	sst.tableSize = int(fileInfo.Size())
+	sst.tableSize = fileInfo.Size()
 
 	return sst, nil
 }
@@ -161,35 +183,48 @@ func newBlock(key []byte, offset, size int64) BlockIndex {
 	}
 }
 
-func OpenTable(mf *os.File, opts Options) (*SSTable, error) {
-	fileInfo, err := mf.Stat()
+func OpenTable(file *os.File, opts Options) (*SSTable, error) {
+	fileInfo, err := file.Stat()
 	if err != nil {
-		mf.Close()
+		file.Close()
 		return nil, err
 	}
 
 	filename := fileInfo.Name()
 	id, ok := ParseFileID(filename)
 	if !ok {
-		mf.Close()
+		file.Close()
 		return nil, errors.New("Invalid filename: " + filename)
 	}
 
 	t := &SSTable{
-		File:      mf,
+		File:      file,
 		id:        id,
 		opt:       opts,
-		tableSize: int(fileInfo.Size()),
+		tableSize: fileInfo.Size(),
 		CreatedAt: fileInfo.ModTime(),
 	}
 
-	go func() {
+	t.wg.Add(1)
+	go func(wg *sync.WaitGroup) {
+		defer wg.Done()
 		err := t.pullDataFromFile()
 		if err != nil {
 			// TODO: return errors.New("couldn't get dat afrom file")
 			return
 		}
-	}()
+	}(t.wg)
+
+	t.wg.Add(1)
+	go func(wg *sync.WaitGroup) {
+		defer func() {
+			t.File.Seek(0, io.SeekStart)
+			wg.Done()
+		}()
+
+		out := t.rebuildBlockIndexFromFile()
+		t.buildIndex(out)
+	}(t.wg)
 
 	//TODO:
 	// t.ref.Store(1)
@@ -207,16 +242,32 @@ func (sst *SSTable) pullDataFromFile() error {
 	sst.data = result
 	return nil
 }
+
+func (sst *SSTable) buildIndex(out <-chan BlockIndex) {
+	for block := range out {
+		sst.blockIndex = append(sst.blockIndex, block)
+		sst.blockCache.Add(block.offset, block.data)
+	}
+	if len(sst.blockIndex) != 0 {
+		firstOffset := sst.blockIndex[0].offset
+		entries, _ := sst.blockCache.Get(firstOffset)
+		sst.smallest = entries[0].Key
+
+		lastOffset := sst.blockIndex[len(sst.blockIndex)-1].offset
+		entries, _ = sst.blockCache.Get(lastOffset)
+		sst.biggest = entries[len(entries)-1].Key
+	}
+}
+
 func (sst *SSTable) Close() error {
+	sst.wg.Wait()
 	fileName := sst.File.Name()
 
 	if err := sst.File.Close(); err != nil {
-		//fmt.Println("Ошибка закрытия:", err)
 		return err
 	}
 
 	if err := os.Remove(fileName); err != nil {
-		// fmt.Println("Ошибка удаления:", err)
 		return err
 	}
 	return nil
