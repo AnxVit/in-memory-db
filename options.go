@@ -23,6 +23,7 @@ type Options struct {
 	NumCompactors       int64
 	LevelSizeMultiplier int64
 	BaseLevelSize       int64
+	NumLevelZeroTables  int64
 
 	MaxLevels int
 

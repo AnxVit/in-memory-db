@@ -57,6 +57,10 @@ func (sst *SSTable) GetSmallest() []byte {
 	return sst.smallest
 }
 
+func (sst *SSTable) GetBiggest() []byte {
+	return sst.biggest
+}
+
 func (sst *SSTable) GetSize() int64 {
 	return sst.tableSize
 }

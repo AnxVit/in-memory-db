@@ -11,6 +11,6 @@ const (
 
 type Operation struct {
 	Op    OPR_CODE
-	Key   interface{}
-	Value interface{}
+	Key   []byte
+	Value []byte
 }

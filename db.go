@@ -10,6 +10,10 @@ import (
 	"github.com/pkg/errors"
 )
 
+const (
+	kvWriteChCapacity = 100
+)
+
 type DB struct {
 	memtable     *memtable
 	memtableLock *sync.RWMutex // ?
@@ -131,6 +135,107 @@ func (db *DB) IsClosed() bool {
 	return db.isClosed.Load() == 1
 }
 
+func (db *DB) doWrites(wg *sync.WaitGroup) {
+	defer wg.Done()
+	semaphore := make(chan struct{}, 1)
+
+	writeRequests := func(reqs []*request) error {
+		if err := db.writeRequests(reqs); err != nil {
+			return err
+		}
+		<-semaphore
+		return nil
+	}
+
+	reqs := make([]*request, 0, 10)
+	for {
+		var r *request
+		select {
+		case r = <-db.writeCh:
+			// case <-lc.HasBeenClosed():
+			// 	goto closedCase
+		}
+
+		for {
+			reqs = append(reqs, r)
+
+			if len(reqs) >= kvWriteChCapacity {
+				semaphore <- struct{}{} // blocking.
+				goto writeCase
+			}
+
+			select {
+			// Either push to pending, or continue to pick from writeCh.
+			case r = <-db.writeCh:
+			case semaphore <- struct{}{}:
+				goto writeCase
+				// case <-lc.HasBeenClosed():
+				// 	goto closedCase
+			}
+		}
+
+		// closedCase:
+		// 	// All the pending request are drained.
+		// 	// Don't close the writeCh, because it has be used in several places.
+		// 	for {
+		// 		select {
+		// 		case r = <-db.writeCh:
+		// 			reqs = append(reqs, r)
+		// 		default:
+		// 			pendingCh <- struct{}{} // Push to pending before doing a write.
+		// 			writeRequests(reqs)
+		// 			return
+		// 		}
+		// 	}
+
+	writeCase:
+		go writeRequests(reqs)
+		reqs = make([]*request, 0, 10)
+	}
+}
+
+func (db *DB) writeRequests(reqs []*request) error {
+	if len(reqs) == 0 {
+		return nil
+	}
+
+	for _, b := range reqs {
+		if len(b.Entries) == 0 {
+			continue
+		}
+		var i uint64
+		var err error
+		for err = db.checkFlushQueue(); err == ErrorsWait; err = db.checkFlushQueue() {
+			i++
+			if i%100 == 0 {
+			}
+
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err != nil {
+			return errors.WithMessage(err, "writeRequests")
+		}
+		if err := db.writeToLSM(b.Entries); err != nil {
+			return errors.WithMessage(err, "writeRequests")
+		}
+	}
+
+	return nil
+}
+
+func (db *DB) writeToLSM(b []*Entry) error {
+	// We should check the length of b.Prts and b.Entries only when badger is not
+	// running in InMemory mode. In InMemory mode, we don't wr
+
+	for _, entry := range b {
+		err := db.memtable.Put(entry)
+		if err != nil {
+			return errors.WithMessage(err, "while writing to memTable")
+		}
+	}
+	return db.memtable.SyncWAL()
+}
+
 func (db *DB) checkFlushQueue() error {
 	var err error
 	db.lock.Lock()
@@ -150,7 +255,7 @@ func (db *DB) checkFlushQueue() error {
 
 		return nil
 	default:
-		return errors.New("cannot drop to flushQueue")
+		return ErrorsWait
 	}
 }
 
@@ -228,6 +333,10 @@ func (db *DB) get(key []byte) (interface{}, error) {
 		}
 	}
 	return db.lc.get(key)
+}
+
+func (db *DB) write(entry *Entry) error {
+	return nil
 }
 
 // TODO: dropAll

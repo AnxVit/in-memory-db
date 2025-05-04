@@ -3,8 +3,6 @@ package main
 import (
 	"GoKeyValueWarehouse/skiplist"
 	"GoKeyValueWarehouse/wal"
-	"bytes"
-	"encoding/gob"
 )
 
 type memtable struct {
@@ -30,24 +28,19 @@ func (db *DB) newMemtable() (*memtable, error) {
 	return m, nil
 }
 
-func (mt *memtable) SyncWAL() {
-	mt.wal.Sync()
+func (mt *memtable) SyncWAL() error {
+	return mt.wal.Sync()
 }
 
-func (mt *memtable) Put(op *Operation) error {
+func (mt *memtable) Put(entry *Entry) error {
 	if mt.wal != nil {
-		data := serializeOp(op.Op, op.Key, op.Value)
+		data := serializeOp(entry.Key, entry.Value)
 		if err := mt.wal.Write(mt.index, data); err != nil {
 			return err
 		}
 	}
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	err := enc.Encode(op.Key)
-	if err != nil {
-		return err
-	}
-	mt.sl.Insert(buf.Bytes(), op.Value, nil)
+
+	mt.sl.Insert(entry.Key, entry.Value, nil)
 
 	return nil
 }

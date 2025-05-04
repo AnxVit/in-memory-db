@@ -2,20 +2,30 @@ package main
 
 import (
 	"GoKeyValueWarehouse/levels/sstable"
-	"GoKeyValueWarehouse/operation"
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
 	"math"
 )
 
-func serializeOp(op operation.OPR_CODE, key, value interface{}) []byte {
+type Iterator interface {
+	Next()
+	Rewind()
+	Seek(key []byte)
+	Key() []byte
+	Value() interface{}
+	Valid() bool
+
+	// All iterators should be closed so that file garbage collection works.
+	Close() error
+}
+
+func serializeOp(key, value []byte) []byte {
 	var buf bytes.Buffer
 
 	enc := gob.NewEncoder(&buf)
 
-	operation := operation.Operation{
-		Op:    op,
+	operation := Entry{
 		Key:   key,
 		Value: value,
 	}
