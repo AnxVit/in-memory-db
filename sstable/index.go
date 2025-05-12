@@ -7,10 +7,10 @@ import (
 )
 
 type BlockIndex struct {
-	key    []byte
-	offset int64
-	size   int64
-	data   []Entry
+	smallest []byte
+	biggest  []byte
+	offset   int64
+	size     int64
 }
 
 func (sst *SSTable) rebuildBlockIndexFromFile() <-chan BlockIndex {
@@ -20,20 +20,17 @@ func (sst *SSTable) rebuildBlockIndexFromFile() <-chan BlockIndex {
 
 		var currentOffset int64 = 0
 		for {
-			entries, nextOffset, err := readEntries(sst.File, currentOffset, int(sst.opt.BlockSize))
+			smallest, biggest, nextOffset, err := readBlock(sst.File, currentOffset, int(sst.opt.BlockSize))
 			if err != nil {
 				// TODO: error
 				return
 			}
-			if len(entries) == 0 {
-				break
-			}
 
 			out <- BlockIndex{
-				key:    entries[0].Key,
-				offset: currentOffset,
-				size:   nextOffset - currentOffset,
-				data:   entries,
+				smallest: smallest,
+				biggest:  biggest,
+				offset:   currentOffset,
+				size:     nextOffset - currentOffset,
 			}
 
 			currentOffset = nextOffset
@@ -43,16 +40,17 @@ func (sst *SSTable) rebuildBlockIndexFromFile() <-chan BlockIndex {
 	return out
 }
 
-func readEntries(file *os.File, offset int64, blockSize int) ([]Entry, int64, error) {
+func readBlock(file *os.File, offset int64, blockSize int) ([]byte, []byte, int64, error) {
 	info, _ := file.Stat()
 	size := info.Size()
 
 	currentOffset, _ := file.Seek(offset, io.SeekStart)
 
-	var err error
-
-	entries := make([]Entry, 0)
-
+	var (
+		err      error
+		firstKey []byte
+		lastKey  []byte
+	)
 	for (currentOffset - offset) < int64(blockSize) {
 		var keyLen int32
 		if err = binary.Read(file, binary.LittleEndian, &keyLen); err != nil {
@@ -64,6 +62,10 @@ func readEntries(file *os.File, offset int64, blockSize int) ([]Entry, int64, er
 		key := make([]byte, keyLen)
 		if err = binary.Read(file, binary.LittleEndian, &key); err != nil {
 			break
+		}
+		lastKey = key
+		if len(firstKey) == 0 {
+			firstKey = key
 		}
 
 		var valueLen int32
@@ -78,22 +80,14 @@ func readEntries(file *os.File, offset int64, blockSize int) ([]Entry, int64, er
 			break
 		}
 
-		entries = append(entries, Entry{
-			Key:   key,
-			Value: value,
-		})
-
 		currentOffset, _ = file.Seek(0, io.SeekCurrent)
 	}
 
 	currentOffset, _ = file.Seek(0, io.SeekCurrent)
 
 	if err != io.EOF {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 
-	if len(entries) == 0 {
-		return nil, 0, nil
-	}
-	return entries, currentOffset, nil
+	return firstKey, lastKey, currentOffset, nil
 }

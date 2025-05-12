@@ -3,16 +3,18 @@ package sstable
 import (
 	"bytes"
 	"container/heap"
+	"time"
 )
 
 type KV struct {
-	Key   []byte
-	Value []byte
+	Key     []byte
+	Version time.Time
+	Value   []byte
 }
 
 type item struct {
 	kv    KV
-	srcID int // index of iterator
+	srcID int // index of table
 	index [2]int
 }
 
@@ -38,6 +40,7 @@ func (pq *priorityQueue) Pop() interface{} {
 type MergeSSTableIterator struct {
 	tables  []*SSTable
 	pq      priorityQueue
+	current KV
 	visited map[string]bool
 }
 
@@ -48,10 +51,14 @@ func NewMergeSSTableIterator(tables []*SSTable) *MergeSSTableIterator {
 	}
 
 	for tableIdx, table := range tables {
+		entry, err := table.searchInBlock(table.blockIndex[0].smallest, table.blockIndex[0])
+		if err != nil {
+			// log
+		}
 		heap.Push(&it.pq, &item{
 			kv: KV{
-				Key:   table.blockIndex[0].data[0].Key,
-				Value: table.blockIndex[0].data[0].Value,
+				Key:   entry.Key,
+				Value: entry.Value,
 			},
 			srcID: tableIdx,
 			index: [2]int{0, 0},
@@ -61,7 +68,7 @@ func NewMergeSSTableIterator(tables []*SSTable) *MergeSSTableIterator {
 	return it
 }
 
-func (it *MergeSSTableIterator) HasNext() bool {
+func (it *MergeSSTableIterator) Vaild() bool {
 	for len(it.pq) > 0 {
 		top := heap.Pop(&it.pq).(*item)
 		key := top.kv.Key
@@ -72,22 +79,40 @@ func (it *MergeSSTableIterator) HasNext() bool {
 			return true
 		}
 
-		var nextIdx [2]int
-		entries := it.tables[top.srcID].blockIndex[top.index[0]].data
+		var (
+			nextIdx     [2]int
+			isNextBlock bool
+		)
+		block := it.tables[top.srcID].blockIndex[top.index[0]]
+		entries, err := it.tables[top.srcID].getEntriesFromBlock(block)
+		if err != nil {
+			// log
+			return false
+		}
 		if len(entries) > top.index[1]+1 {
 			nextIdx = [2]int{top.index[0], top.index[1] + 1}
 		} else {
 			if len(it.tables[top.srcID].blockIndex) > top.index[0]+1 {
+				isNextBlock = true
 				nextIdx = [2]int{top.index[0] + 1, 0}
 			} else {
 				continue
 			}
 		}
 
+		if isNextBlock {
+			block := it.tables[top.srcID].blockIndex[nextIdx[0]]
+			entries, err = it.tables[top.srcID].getEntriesFromBlock(block)
+			if err != nil {
+				// log
+				return false
+			}
+		}
+
 		heap.Push(&it.pq, &item{
 			kv: KV{
-				Key:   it.tables[top.srcID].blockIndex[nextIdx[0]].data[nextIdx[1]].Key,
-				Value: it.tables[top.srcID].blockIndex[nextIdx[0]].data[nextIdx[1]].Value,
+				Key:   entries[nextIdx[1]].Key,
+				Value: entries[nextIdx[1]].Value,
 			},
 			srcID: top.srcID,
 			index: nextIdx,
@@ -96,33 +121,54 @@ func (it *MergeSSTableIterator) HasNext() bool {
 	return false
 }
 
-func (it *MergeSSTableIterator) Next() KV {
-	if !it.HasNext() {
-		panic("No more elements")
-	}
+func (it *MergeSSTableIterator) Next() {
 	top := heap.Pop(&it.pq).(*item)
 
-	var nextIdx [2]int
-	entries := it.tables[top.srcID].blockIndex[top.index[0]].data
+	var (
+		nextIdx     [2]int
+		isNextBlock bool
+	)
+	block := it.tables[top.srcID].blockIndex[top.index[0]]
+	entries, err := it.tables[top.srcID].getEntriesFromBlock(block)
+	if err != nil {
+		// log
+	}
 	if len(entries) > top.index[1]+1 {
 		nextIdx = [2]int{top.index[0], top.index[1] + 1}
 	} else {
 		if len(it.tables[top.srcID].blockIndex) > top.index[0]+1 {
+			isNextBlock = true
 			nextIdx = [2]int{top.index[0] + 1, 0}
 		} else {
-			return top.kv
+			it.current = top.kv
+		}
+	}
+	if isNextBlock {
+		block := it.tables[top.srcID].blockIndex[nextIdx[0]]
+		entries, err = it.tables[top.srcID].getEntriesFromBlock(block)
+		if err != nil {
+			// log
+			return
 		}
 	}
 	heap.Push(&it.pq, &item{
 		kv: KV{
-			Key:   it.tables[top.srcID].blockIndex[nextIdx[0]].data[nextIdx[1]].Key,
-			Value: it.tables[top.srcID].blockIndex[nextIdx[0]].data[nextIdx[1]].Value,
+			Key:   entries[nextIdx[1]].Key,
+			Value: entries[nextIdx[1]].Value,
 		},
 		srcID: top.srcID,
 		index: nextIdx,
 	})
 
-	return top.kv
+	it.current = top.kv
+}
+
+func (it *MergeSSTableIterator) Key() []byte {
+	return it.current.Key
+}
+
+func (it *MergeSSTableIterator) Value() []byte {
+	return it.current.Value
 }
 
 func (it *MergeSSTableIterator) Close() {

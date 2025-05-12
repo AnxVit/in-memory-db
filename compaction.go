@@ -1,7 +1,8 @@
-package main
+package db
 
 import (
-	"GoKeyValueWarehouse/levels/sstable"
+	"GoKeyValueWarehouse/skiplist"
+	"GoKeyValueWarehouse/sstable"
 	"bytes"
 	"sort"
 	"sync"
@@ -17,11 +18,20 @@ type compactDef struct {
 	top []*sstable.SSTable
 	bot []*sstable.SSTable
 
-	thisRange keyRange
-	nextRange keyRange
-	splits    []keyRange
+	thisRange KeyRange
+	nextRange KeyRange
 
 	thisSize int64
+}
+
+func (cd *compactDef) lockLevels() {
+	cd.thisLevel.RLock()
+	cd.nextLevel.RLock()
+}
+
+func (cd *compactDef) unlockLevels() {
+	cd.thisLevel.RUnlock()
+	cd.nextLevel.RUnlock()
 }
 
 type compactionPriority struct {
@@ -60,7 +70,7 @@ func (cs *compactStatus) compareAndAdd(cd compactDef) bool {
 	return true
 }
 
-func (cs *compactStatus) overlapsWith(level int, this keyRange) bool {
+func (cs *compactStatus) overlapsWith(level int, this KeyRange) bool {
 	cs.RLock()
 	defer cs.RUnlock()
 
@@ -74,12 +84,34 @@ func (cs *compactStatus) delSize(l int) int64 {
 	return cs.levels[l].delSize
 }
 
+func (cs *compactStatus) delete(cd compactDef) {
+	cs.Lock()
+	defer cs.Unlock()
+
+	thisLevel := cs.levels[cd.thisLevel.lvID]
+	nextLevel := cs.levels[cd.nextLevel.lvID]
+
+	thisLevel.delSize -= cd.thisSize
+	_ = thisLevel.remove(cd.thisRange)
+
+	if cd.thisLevel != cd.nextLevel && !cd.nextRange.isEmpty() {
+		_ = nextLevel.remove(cd.nextRange)
+	}
+
+	for _, t := range append(cd.top, cd.bot...) {
+		_, ok := cs.tables[t.GetID()]
+		if ok {
+			delete(cs.tables, t.GetID())
+		}
+	}
+}
+
 type levelCompactStatus struct {
-	ranges  []keyRange
+	ranges  []KeyRange
 	delSize int64
 }
 
-func (lcs *levelCompactStatus) overlapsWith(dst keyRange) bool {
+func (lcs *levelCompactStatus) overlapsWith(dst KeyRange) bool {
 	for _, r := range lcs.ranges {
 		if r.overlapsWith(dst) {
 			return true
@@ -88,17 +120,37 @@ func (lcs *levelCompactStatus) overlapsWith(dst keyRange) bool {
 	return false
 }
 
-type keyRange struct {
+func (lcs *levelCompactStatus) remove(dst KeyRange) bool {
+	final := lcs.ranges[:0]
+	var found bool
+	for _, r := range lcs.ranges {
+		if !r.equals(dst) {
+			final = append(final, r)
+		} else {
+			found = true
+		}
+	}
+	lcs.ranges = final
+	return found
+}
+
+type KeyRange struct {
 	left  []byte
 	right []byte
 	end   bool
 }
 
-func (r keyRange) isEmpty() bool {
+func (r *KeyRange) equals(dst KeyRange) bool {
+	return bytes.Equal(r.left, dst.left) &&
+		bytes.Equal(r.right, dst.right) &&
+		r.end == dst.end
+}
+
+func (r *KeyRange) isEmpty() bool {
 	return len(r.left) == 0 && len(r.right) == 0 && !r.end
 }
 
-func (r *keyRange) extend(kr keyRange) {
+func (r *KeyRange) extend(kr KeyRange) {
 	if kr.isEmpty() {
 		return
 	}
@@ -116,7 +168,7 @@ func (r *keyRange) extend(kr keyRange) {
 	}
 }
 
-func (r keyRange) overlapsWith(dst keyRange) bool {
+func (r *KeyRange) overlapsWith(dst KeyRange) bool {
 	if r.isEmpty() {
 		return true
 	}
@@ -139,11 +191,11 @@ func (r keyRange) overlapsWith(dst keyRange) bool {
 	return true
 }
 
-var endRange = keyRange{end: true}
+var endRange = KeyRange{end: true}
 
-func getKeyRange(tables ...*sstable.SSTable) keyRange {
+func getKeyRange(tables ...*sstable.SSTable) KeyRange {
 	if len(tables) == 0 {
-		return keyRange{}
+		return KeyRange{}
 	}
 	smallest := tables[0].GetSmallest()
 	biggest := tables[0].GetBiggest()
@@ -156,25 +208,21 @@ func getKeyRange(tables ...*sstable.SSTable) keyRange {
 		}
 	}
 
-	return keyRange{
-		left:  smallest,
-		right: biggest,
+	return KeyRange{
+		left:  KeyWithTs(smallest),
+		right: KeyWithTs(biggest),
 	}
 }
 
-func (lc *LevelsController) compactBuildTables(
-	lev int, cd compactDef) ([]*sstable.SSTable, func() error, error) {
-
+func (lc *LevelsController) compactBuildTables(cd compactDef) ([]*sstable.SSTable, func() error, error) {
 	topTables := append(cd.top, cd.bot...)
 
 	res := make(chan *sstable.SSTable)
-	for _, kr := range cd.splits {
-		go func(kr keyRange) {
-			it := sstable.NewMergeSSTableIterator(topTables)
-			defer it.Close()
-			lc.subcompact(it, cd, res)
-		}(kr)
-	}
+	go func() {
+		it := sstable.NewMergeSSTableIterator(topTables)
+		defer it.Close()
+		lc.subcompact(it, cd, res)
+	}()
 
 	var newTables []*sstable.SSTable
 	var wg sync.WaitGroup
@@ -199,72 +247,19 @@ func (lc *LevelsController) compactBuildTables(
 }
 
 func (s *LevelsController) subcompact(it *sstable.MergeSSTableIterator, cd compactDef, res chan<- *sstable.SSTable) {
-	var (
-		lastKey, skipKey []byte
-	)
-
 	addKeys := func() {
-		var tableKr keyRange
-		for it.HasNext() {
-
-			KV := it.Next()
-
-			if len(skipKey) > 0 {
-				if SameKey(KV.Key, skipKey) {
-					continue
-				} else {
-					skipKey = skipKey[:0]
-				}
-			}
-
-			if !SameKey(KV.Key, lastKey) {
-				// if len(kr.right) > 0 && y.CompareKeys(it.Key(), kr.right) >= 0 {
-				// 	break
-				// }
-				// if builder.ReachedCapacity() {
-				// 	// Only break if we are on a different key, and have reached capacity. We want
-				// 	// to ensure that all versions of the key are stored in the same sstable, and
-				// 	// not divided across multiple tables at the same level.
-				// 	break
-				// }
-
-				lastKey = append(lastKey, KV.Key...)
-
-				if len(tableKr.left) == 0 {
-					tableKr.left = append(tableKr.left, KV.Key...)
-				}
-				tableKr.right = lastKey
-
-			}
-			isExpired := isDeletedOrExpired(vs.Meta, vs.ExpiresAt)
-			switch {
-			case isExpired:
-				continue
-			default:
-				//builder.Add(it.Key(), vs, vp.Len)
-			}
+		for ; it.Vaild(); it.Next() {
+			if bytes.Equal(it.Value(),[]byte(skiplist.TOMBSTONE))
 		}
 	}
-
-	// if len(kr.left) > 0 {
-	// 	it.Seek(kr.left)
-	// } else {
-	// 	it.Rewind()
-	// }
-	for it.Valid() {
-		// if len(kr.right) > 0 && y.CompareKeys(it.Key(), kr.right) >= 0 {
-		// 	break
-		// }
-		bopts := s.db.opt.SSTableOpt
-		addKeys()
-		go func(fileID uint64) {
-			tbl, err := sstable.CreateTable(fileID, nil, bopts)
-			if err != nil {
-				return
-			}
-			res <- tbl
-		}(s.getNextFileID())
-	}
+	addKeys()
+	go func(fileID uint64) {
+		tbl, err := sstable.CreateTable(fileID, nil, s.db.opt.SSTableOpt)
+		if err != nil {
+			return
+		}
+		res <- tbl
+	}(s.getNextFileID())
 }
 
 func SameKey(src, dst []byte) bool {

@@ -2,15 +2,16 @@ package skiplist
 
 import (
 	"bytes"
+	"encoding/json"
 	"time"
 )
 
 type Iterator interface {
-	Next() bool                // Move to the next node
-	Prev() bool                // Move to the previous node
-	HasNext() bool             // Check if there is a next node
-	HasPrev() bool             // Check if there is a previous node
-	Current() ([]byte, []byte) // Get the current key and value
+	Next() bool                                // Move to the next node
+	Prev() bool                                // Move to the previous node
+	HasNext() bool                             // Check if there is a next node
+	HasPrev() bool                             // Check if there is a previous node
+	Current() ([]byte, []byte, *time.Duration) // Get the current key and value
 }
 
 type SkipListIterator struct {
@@ -31,7 +32,6 @@ func (it *SkipListIterator) Next() bool {
 		if !it.current.IsExpired() {
 			return true
 		}
-		it.current.expired = true
 	}
 	return false
 }
@@ -41,7 +41,6 @@ func (it *SkipListIterator) Prev() bool {
 	for i := it.skipList.h; i >= 0; i-- {
 		for current.lv.nodes[i] != nil && bytes.Compare(current.lv.nodes[i].key, it.current.key) < 0 {
 			if current.lv.nodes[i].IsExpired() {
-				it.current.expired = true
 			}
 			current = current.lv.nodes[i]
 		}
@@ -67,12 +66,12 @@ func (it *SkipListIterator) HasPrev() bool {
 	return it.current != it.skipList.header
 }
 
-func (it *SkipListIterator) Current() ([]byte, interface{}, *time.Duration) {
+func (it *SkipListIterator) Current() ([]byte, []byte, *time.Duration) {
 	if it.current == it.skipList.header || it.current.IsExpired() {
 		if it.current.IsExpired() {
-			it.current.expired = true
 		}
 		return nil, nil, nil
 	}
-	return it.current.key, it.current.value, timeToDuration(it.current.ttl)
+	value, _ := json.Marshal(it.current.value)
+	return it.current.key, value, timeToDuration(it.current.ttl)
 }

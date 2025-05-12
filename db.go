@@ -1,7 +1,9 @@
-package main
+package db
 
 import (
-	"GoKeyValueWarehouse/levels/sstable"
+	"GoKeyValueWarehouse/skiplist"
+	"GoKeyValueWarehouse/sstable"
+	"context"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -14,14 +16,27 @@ const (
 	kvWriteChCapacity = 100
 )
 
-type DB struct {
-	memtable     *memtable
-	memtableLock *sync.RWMutex // ?
+type CancelComponents struct {
+	writer     context.CancelFunc
+	compaction context.CancelFunc
+}
 
-	lc *LevelsController
+func (c *CancelComponents) Do() {
+	c.writer()
+	c.compaction()
+}
+
+var cancelComponents = &CancelComponents{}
+
+type DB struct {
+	memtable       *memtable
+	memtableLock   *sync.RWMutex
+	memtableNextID int
+
+	lc       *LevelsController
+	manifest *manifest
 
 	flushQueue     []*memtable
-	flushQueueLock *sync.Mutex
 	flushQueueChan chan *memtable
 
 	transactionsLock *sync.RWMutex
@@ -29,13 +44,13 @@ type DB struct {
 
 	isClosed atomic.Uint32
 
-	wg   *sync.WaitGroup
-	lock *sync.RWMutex
+	writeCh chan *request
+	wg      *sync.WaitGroup
+	lock    *sync.RWMutex
 
 	opt       Options
 	closeOnce sync.Once
 	exit      chan struct{}
-	compress  bool
 }
 
 func Open(opts Options) (*DB, error) {
@@ -47,62 +62,68 @@ func Open(opts Options) (*DB, error) {
 	db := &DB{
 		memtableLock: &sync.RWMutex{},
 
-		flushQueue:     make([]*memtable, 0),
-		flushQueueLock: &sync.Mutex{},
+		flushQueue: make([]*memtable, opts.NumImmutable),
 
 		transactionsLock: &sync.RWMutex{},
 		transactions:     make([]*Tranzaction, 0),
 
-		wg:   &sync.WaitGroup{},
+		writeCh: make(chan *request, kvWriteChCapacity),
+		wg:      &sync.WaitGroup{},
+
 		opt:  opts,
 		exit: make(chan struct{}),
 	}
 
-	db.memtable, err = db.newMemtable()
+	err = db.openMemtables()
 	if err != nil {
 		return nil, err
 	}
 
-	db.lc, err = newLevelsController(db, &MetaSST{})
+	db.memtable, err = db.newMemtable(db.memtableNextID)
 	if err != nil {
 		return nil, err
 	}
 
-	// db.wg.Add(1)
-	// go db.backgroundWalWriter() // start the background wal writer
-	// db.printLog("Background WAL writer started")
+	db.manifest, err = NewManifest(opts.ManifestDir)
+	if err != nil {
+		return nil, err
+	}
+
+	db.lc, err = newLevelsController(db, &db.manifest.manifestInfo)
+	if err != nil {
+		return nil, err
+	}
 
 	db.wg.Add(1)
-	go db.flushMemtable(db.wg)
+	ctxWriter, cancel := context.WithCancel(context.Background())
+	go db.backgroundWriter(ctxWriter, db.wg) // start the background writer
+	cancelComponents.writer = cancel
 
 	db.wg.Add(1)
-	go db.startCompactions(db.wg) // start the background compactor
-	// db.printLog("Background compactor started")
+	go db.flushMemtable(db.wg) // flush memtable
 
-	//db.printLog("DB opened successfully")
+	db.wg.Add(1)
+	ctxCompaction, cancel := context.WithCancel(context.Background())
+	go db.startCompactions(ctxCompaction, db.wg) // start the background compactor
+	cancelComponents.compaction = cancel
 
 	return db, nil
 }
 
 // TODO: change wg wait
 func (db *DB) close() error {
-	// db.printLog("Closing up")
 	db.isClosed.Store(1)
 
 	if db.memtable.sl.Size() > 0 {
-		// db.printLog(fmt.Sprintf("Memtable is of size %d bytes and is being flushed to disk", db.memtable.Size()))
 		// db.appendMemtableToFlushQueue()
 	}
 
-	// signal the background operations to exit
+	cancelComponents.Do()
+
 	close(db.exit)
+	close(db.writeCh)
 
-	// db.printLog("Waiting for background operations to finish")
-	// wait for the background operations to finish
 	db.wg.Wait()
-
-	// db.printLog("Background operations finished")
-	// db.printLog("Closing SSTables")
 
 	// for _, sstable := range db.sstables {
 	// 	err := sstable.Close()
@@ -110,15 +131,15 @@ func (db *DB) close() error {
 	// 		return err
 	// 	}
 	// }
-	// db.printLog("SSTables closed")
 	if db.memtable.wal != nil {
-		// db.printLog("Closing WAL")
+		close(db.flushQueueChan)
 		err := db.memtable.wal.Close()
 		if err != nil {
 			return err
 		}
-		// db.printLog("WAL closed")
 	}
+
+	db.manifest.close()
 
 	return nil
 }
@@ -135,62 +156,69 @@ func (db *DB) IsClosed() bool {
 	return db.isClosed.Load() == 1
 }
 
-func (db *DB) doWrites(wg *sync.WaitGroup) {
+func (db *DB) backgroundWriter(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
+
 	semaphore := make(chan struct{}, 1)
 
-	writeRequests := func(reqs []*request) error {
-		if err := db.writeRequests(reqs); err != nil {
-			return err
-		}
-		<-semaphore
-		return nil
+	handleBatch := func(batch []*request) {
+		go func(reqs []*request) {
+			defer func() { <-semaphore }()
+			_ = db.writeRequests(reqs)
+		}(batch)
 	}
 
-	reqs := make([]*request, 0, 10)
+	var (
+		reqs = make([]*request, 0, kvWriteChCapacity)
+		r    *request
+	)
+
 	for {
-		var r *request
 		select {
 		case r = <-db.writeCh:
-			// case <-lc.HasBeenClosed():
-			// 	goto closedCase
+		case <-ctx.Done():
+			goto doneLoop
 		}
 
+	collectLoop:
 		for {
 			reqs = append(reqs, r)
 
 			if len(reqs) >= kvWriteChCapacity {
-				semaphore <- struct{}{} // blocking.
-				goto writeCase
+				semaphore <- struct{}{}
+				handleBatch(reqs)
+				reqs = make([]*request, 0, kvWriteChCapacity)
+				break collectLoop
 			}
 
 			select {
-			// Either push to pending, or continue to pick from writeCh.
 			case r = <-db.writeCh:
 			case semaphore <- struct{}{}:
-				goto writeCase
-				// case <-lc.HasBeenClosed():
-				// 	goto closedCase
+				handleBatch(reqs)
+				reqs = make([]*request, 0, kvWriteChCapacity)
+				break collectLoop
+			case <-ctx.Done():
+				goto doneLoop
 			}
 		}
 
-		// closedCase:
-		// 	// All the pending request are drained.
-		// 	// Don't close the writeCh, because it has be used in several places.
-		// 	for {
-		// 		select {
-		// 		case r = <-db.writeCh:
-		// 			reqs = append(reqs, r)
-		// 		default:
-		// 			pendingCh <- struct{}{} // Push to pending before doing a write.
-		// 			writeRequests(reqs)
-		// 			return
-		// 		}
-		// 	}
+		if ctx.Err() != nil {
+			goto doneLoop
+		}
+	}
 
-	writeCase:
-		go writeRequests(reqs)
-		reqs = make([]*request, 0, 10)
+doneLoop:
+	for {
+		select {
+		case r = <-db.writeCh:
+			reqs = append(reqs, r)
+		default:
+			if len(reqs) > 0 {
+				semaphore <- struct{}{}
+				handleBatch(reqs)
+			}
+			return
+		}
 	}
 }
 
@@ -207,9 +235,6 @@ func (db *DB) writeRequests(reqs []*request) error {
 		var err error
 		for err = db.checkFlushQueue(); err == ErrorsWait; err = db.checkFlushQueue() {
 			i++
-			if i%100 == 0 {
-			}
-
 			time.Sleep(10 * time.Millisecond)
 		}
 		if err != nil {
@@ -224,9 +249,6 @@ func (db *DB) writeRequests(reqs []*request) error {
 }
 
 func (db *DB) writeToLSM(b []*Entry) error {
-	// We should check the length of b.Prts and b.Entries only when badger is not
-	// running in InMemory mode. In InMemory mode, we don't wr
-
 	for _, entry := range b {
 		err := db.memtable.Put(entry)
 		if err != nil {
@@ -248,7 +270,7 @@ func (db *DB) checkFlushQueue() error {
 	select {
 	case db.flushQueueChan <- db.memtable:
 		db.flushQueue = append(db.flushQueue, db.memtable)
-		db.memtable, err = db.newMemtable()
+		db.memtable, err = db.newMemtable(db.memtableNextID)
 		if err != nil {
 			return errors.WithMessage(err, "cannot create new mem table")
 		}
@@ -282,16 +304,15 @@ func (db *DB) flushMemtable(wg *sync.WaitGroup) {
 	}
 }
 
-func (db *DB) startCompactions(wg *sync.WaitGroup) {
+func (db *DB) startCompactions(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	db.lc.startCompact()
+	db.lc.startCompact(ctx, wg)
 }
 
 func (db *DB) flushMemtableToDisk(mt *memtable) error {
-	// TODO: change code
-	data := getEntryFromMemtable(mt)
+	iter := skiplist.NewIterator(mt.sl)
 	fileID := db.lc.getNextFileID()
-	tbl, err := sstable.CreateTable(fileID, data, db.opt.SSTableOpt)
+	tbl, err := sstable.CreateTable(fileID, iter, db.opt.SSTableOpt)
 	if err != nil {
 		return errors.WithMessage(err, "could not flush memtable to disk")
 	}
@@ -306,7 +327,6 @@ func (db *DB) getMemTables() ([]*memtable, func()) {
 	tables = append(tables, db.memtable)
 	// db.memtable.IncrRef()
 
-	// Get immutable memtables.
 	last := len(db.flushQueue) - 1
 	for i := range db.flushQueue {
 		tables = append(tables, db.flushQueue[last-i])
@@ -323,11 +343,11 @@ func (db *DB) get(key []byte) (interface{}, error) {
 	if db.IsClosed() {
 		return nil, ErrorClosedDB
 	}
-	tables, decr := db.getMemTables()
+	mts, decr := db.getMemTables()
 	defer decr()
 
-	for i := 0; i < len(tables); i++ {
-		val, ok := tables[i].sl.Search(key)
+	for i := 0; i < len(mts); i++ {
+		val, ok := mts[i].sl.Search(key)
 		if ok {
 			return val, nil
 		}
@@ -335,8 +355,23 @@ func (db *DB) get(key []byte) (interface{}, error) {
 	return db.lc.get(key)
 }
 
-func (db *DB) write(entry *Entry) error {
-	return nil
+var requestPool = sync.Pool{
+	New: func() interface{} {
+		return new(request)
+	},
 }
 
-// TODO: dropAll
+func (db *DB) write(entries []*Entry) error {
+	var size int64
+	for _, e := range entries {
+		size += e.calculateSize()
+	}
+	if size >= db.opt.maxRequestSize {
+		return ErrTooBig
+	}
+	req := requestPool.Get().(*request)
+	req.reset()
+	req.Entries = entries
+	db.writeCh <- req
+	return nil
+}

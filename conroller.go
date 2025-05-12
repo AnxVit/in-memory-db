@@ -1,7 +1,8 @@
-package main
+package db
 
 import (
-	"GoKeyValueWarehouse/levels/sstable"
+	"GoKeyValueWarehouse/sstable"
+	"context"
 	"math"
 	"math/rand"
 	"os"
@@ -24,7 +25,7 @@ type LevelsController struct {
 	cstatus compactStatus
 }
 
-func newLevelsController(db *DB, meta *MetaSST) (*LevelsController, error) {
+func newLevelsController(db *DB, meta *ManifestInfo) (*LevelsController, error) {
 	s := &LevelsController{
 		db: db,
 		lv: make([]*Level, db.opt.MaxLevels),
@@ -45,24 +46,19 @@ func newLevelsController(db *DB, meta *MetaSST) (*LevelsController, error) {
 	tick := time.NewTicker(1 * time.Second)
 	defer tick.Stop()
 
-	for _, table := range meta.Tables {
-		fname := sstable.TableName(table.id, db.opt.Directory)
+	for id, level := range meta.Tables {
+		fname := sstable.TableName(id, db.opt.Directory)
 		select {
 		case <-tick.C:
 		default:
 		}
-		if table.id > maxFileID {
-			maxFileID = table.id
+		if id > maxFileID {
+			maxFileID = id
 		}
-		go func(fname string, lv int) {
+		go func(fname string, lv uint64) {
 			defer func() {
 				numOpened.Add(1)
 			}()
-			// dk, err := db.registry.DataKey(tf.KeyID)
-			// if err != nil {
-			// 	rerr = y.Wrapf(err, "Error while reading datakey")
-			// 	return
-			// }
 
 			file, err := os.Create(fname) // TODO: dir
 			if err != nil {
@@ -76,7 +72,7 @@ func newLevelsController(db *DB, meta *MetaSST) (*LevelsController, error) {
 			mu.Lock()
 			tables[lv] = append(tables[lv], t)
 			mu.Unlock()
-		}(fname, table.level)
+		}(fname, level)
 	}
 
 	s.nextFileID.Store(maxFileID + 1)
@@ -85,24 +81,27 @@ func newLevelsController(db *DB, meta *MetaSST) (*LevelsController, error) {
 	}
 
 	// if err := s.validate(); err != nil {
-	// 	_ = s.cleanupLevels()
-	// 	return nil, errors.WithMessage(err, "Level validation")
 	// }
 
 	return s, nil
 }
 
-func (lc *LevelsController) startCompact() {
+func (lc *LevelsController) startCompact(ctx context.Context, wg *sync.WaitGroup) {
 	n := int(lc.db.opt.NumCompactors)
+	wg.Add(n)
 	for i := 0; i < n; i++ {
-		go lc.runCompactor(i)
+		go lc.runCompactor(ctx, wg, i)
 	}
 }
 
-func (lc *LevelsController) runCompactor(id int) {
+func (lc *LevelsController) runCompactor(ctx context.Context, wg *sync.WaitGroup, id int) {
+	defer wg.Done()
 	randomDelay := time.NewTimer(time.Duration(rand.Int31n(1000)) * time.Millisecond)
 	select {
 	case <-randomDelay.C:
+	case <-ctx.Done():
+		randomDelay.Stop()
+		return
 	}
 
 	var priosBuffer []compactionPriority
@@ -129,7 +128,6 @@ func (lc *LevelsController) runCompactor(id int) {
 		}
 		for _, p := range prios {
 			if id == 0 && p.level == 0 {
-				// Allow worker zero to run level 0, irrespective of its adjusted score.
 			} else if p.adjusted < 1.0 {
 				break
 			}
@@ -153,8 +151,8 @@ func (lc *LevelsController) runCompactor(id int) {
 		select {
 		case <-ticker.C:
 			run()
-			// case <-lc.HasBeenClosed():
-			// 	return
+		case <-ctx.Done():
+			return
 		}
 	}
 }
@@ -244,7 +242,7 @@ func (lc *LevelsController) doCompact(id int, p compactionPriority) error {
 	}
 	defer lc.cstatus.delete(cd) // Remove the ranges from compaction status.
 
-	if err := lc.runCompactDef(id, l, cd); err != nil {
+	if err := lc.runCompactDef(cd); err != nil {
 		return err
 	}
 
@@ -257,7 +255,7 @@ func (s *LevelsController) fillTablesL0ToL0(cd *compactDef) bool {
 	}
 
 	cd.nextLevel = s.lv[0]
-	cd.nextRange = keyRange{}
+	cd.nextRange = KeyRange{}
 	cd.bot = nil
 
 	s.lv[0].RLock()
@@ -271,11 +269,9 @@ func (s *LevelsController) fillTablesL0ToL0(cd *compactDef) bool {
 	now := time.Now()
 	for _, t := range top {
 		if t.GetSize() >= 2*cd.t.fileSize[0] {
-			// This file is already big, don't include it.
 			continue
 		}
 		if now.Sub(t.CreatedAt) < 10*time.Second {
-			// Just created it 10s ago. Don't pick for compaction.
 			continue
 		}
 		if _, beingCompacted := s.cstatus.tables[t.GetID()]; beingCompacted {
@@ -285,21 +281,17 @@ func (s *LevelsController) fillTablesL0ToL0(cd *compactDef) bool {
 	}
 
 	if len(out) < 4 {
-		// If we don't have enough tables to merge in L0, don't do it.
 		return false
 	}
 	cd.thisRange = endRange
 	cd.top = out
 
-	// Avoid any other L0 -> Lbase from happening, while this is going on.
 	thisLevel := s.cstatus.levels[cd.thisLevel.lvID]
 	thisLevel.ranges = append(thisLevel.ranges, endRange)
 	for _, t := range out {
 		s.cstatus.tables[t.GetID()] = struct{}{}
 	}
 
-	// For L0->L0 compaction, we set the target file size to max, so the output is always one file.
-	// This significantly decreases the L0 table stalls and improves the performance.
 	cd.t.fileSize[0] = math.MaxUint32
 	return true
 }
@@ -308,10 +300,8 @@ func (s *LevelsController) fillTablesL0ToLbase(cd *compactDef) bool {
 	if cd.nextLevel.lvID == 0 {
 		panic("Base level can't be zero.")
 	}
-	// We keep cd.p.adjusted > 0.0 here to allow functions in db.go to artificially trigger
-	// L0->Lbase compactions. Those functions wouldn't be setting the adjusted score.
+
 	if cd.p.adjusted > 0.0 && cd.p.adjusted < 1.0 {
-		// Do not compact to Lbase if adjusted score is less than 1.0.
 		return false
 	}
 	cd.lockLevels()
@@ -323,28 +313,21 @@ func (s *LevelsController) fillTablesL0ToLbase(cd *compactDef) bool {
 	}
 
 	var out []*sstable.SSTable
-	if len(cd.dropPrefixes) > 0 {
-		// Use all tables if drop prefix is set. We don't want to compact only a
-		// sub-range. We want to compact all the tables.
-		out = top
+	var kr KeyRange
 
-	} else {
-		var kr keyRange
-		// cd.top[0] is the oldest file. So we start from the oldest file first.
-		for _, t := range top {
-			dkr := getKeyRange(t)
-			if kr.overlapsWith(dkr) {
-				out = append(out, t)
-				kr.extend(dkr)
-			} else {
-				break
-			}
+	for _, t := range top {
+		dkr := getKeyRange(t)
+		if kr.overlapsWith(dkr) {
+			out = append(out, t)
+			kr.extend(dkr)
+		} else {
+			break
 		}
 	}
 	cd.thisRange = getKeyRange(out...)
 	cd.top = out
 
-	left, right := cd.nextLevel.overlappingTables(levelHandlerRLocked{}, cd.thisRange)
+	left, right := cd.nextLevel.overlappingTables(cd.thisRange)
 	cd.bot = make([]*sstable.SSTable, right-left)
 	copy(cd.bot, cd.nextLevel.sst[left:right])
 
@@ -363,7 +346,7 @@ func (s *LevelsController) fillTablesL0(cd *compactDef) bool {
 	return s.fillTablesL0ToL0(cd)
 }
 
-func (lc *LevelsController) runCompactDef(id, l int, cd compactDef) (err error) {
+func (lc *LevelsController) runCompactDef(cd compactDef) (err error) {
 	if len(cd.t.fileSize) == 0 {
 		return errors.New("Filesizes cannot be zero. Targets are not set")
 	}
@@ -371,16 +354,7 @@ func (lc *LevelsController) runCompactDef(id, l int, cd compactDef) (err error) 
 	thisLevel := cd.thisLevel
 	nextLevel := cd.nextLevel
 
-	if thisLevel.lvID == nextLevel.lvID {
-		// don't do anything for L0 -> L0 and Lmax -> Lmax.
-	} else {
-		lc.addSplits(&cd)
-	}
-	if len(cd.splits) == 0 {
-		cd.splits = append(cd.splits, keyRange{})
-	}
-
-	newTables, decr, err := lc.compactBuildTables(l, cd)
+	newTables, decr, err := lc.compactBuildTables(cd)
 	if err != nil {
 		return err
 	}
@@ -389,11 +363,11 @@ func (lc *LevelsController) runCompactDef(id, l int, cd compactDef) (err error) 
 			err = decErr
 		}
 	}()
-	// changeSet := buildChangeSet(&cd, newTables)
+	changeSet := buildChangeSet(&cd, newTables)
 
-	// if err := lc.db.manifest.addChanges(changeSet.Changes); err != nil {
-	// 	return err
-	// }
+	if err := lc.db.manifest.addChanges(changeSet.Changes); err != nil {
+		return err
+	}
 
 	if err := nextLevel.replaceTables(cd.bot, newTables); err != nil {
 		return err
@@ -403,6 +377,58 @@ func (lc *LevelsController) runCompactDef(id, l int, cd compactDef) (err error) 
 	}
 
 	return nil
+}
+
+func (s *LevelsController) fillTables(cd *compactDef) bool {
+	cd.lockLevels()
+	defer cd.unlockLevels()
+
+	tables := make([]*sstable.SSTable, len(cd.thisLevel.sst))
+	copy(tables, cd.thisLevel.sst)
+	if len(tables) == 0 {
+		return false
+	}
+	// if cd.thisLevel.isLastLevel() {
+	// 	return s.fillMaxLevelTables(tables, cd)
+	// }
+	// if len(tables) == 0 || cd.nextLevel == nil {
+	// 	sort.Slice(tables, func(i, j int) bool {
+	// 		return tables[i].MaxVersion() < tables[j].MaxVersion()
+	// 	})
+	// }
+
+	for _, t := range tables {
+		cd.thisSize = t.GetSize()
+		cd.thisRange = getKeyRange(t)
+
+		if s.cstatus.overlapsWith(cd.thisLevel.lvID, cd.thisRange) {
+			continue
+		}
+		cd.top = []*sstable.SSTable{t}
+		left, right := cd.nextLevel.overlappingTables(cd.thisRange)
+
+		cd.bot = make([]*sstable.SSTable, right-left)
+		copy(cd.bot, cd.nextLevel.sst[left:right])
+
+		if len(cd.bot) == 0 {
+			cd.bot = []*sstable.SSTable{}
+			cd.nextRange = cd.thisRange
+			if !s.cstatus.compareAndAdd(*cd) {
+				continue
+			}
+			return true
+		}
+		cd.nextRange = getKeyRange(cd.bot...)
+
+		if s.cstatus.overlapsWith(cd.nextLevel.lvID, cd.nextRange) {
+			continue
+		}
+		if !s.cstatus.compareAndAdd(*cd) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 type targets struct {
@@ -423,7 +449,6 @@ func (lc *LevelsController) levelTargets() targets {
 		targetSize: make([]int64, len(lc.lv)),
 		fileSize:   make([]int64, len(lc.lv)),
 	}
-	// DB size is the size of the last level.
 	dbSize := lc.lastLevel().totalSize
 	for i := len(lc.lv) - 1; i > 0; i-- {
 		ltarget := adjust(dbSize)
@@ -457,18 +482,22 @@ func (lc *LevelsController) levelTargets() targets {
 }
 
 func (ls *LevelsController) addLevel0Table(t *sstable.SSTable) error {
-	go func() {
-		// err := ls.db.manifest.addChanges([]*pb.ManifestChange{
-		// 	newCreateChange(t.ID(), 0, t.KeyID(), t.CompressionType()),
-		// })
-		// if err != nil {
-		// 	return err
-		// }
-	}()
+	errChan := make(chan error)
+	go func(errChan chan<- error) {
+		err := ls.db.manifest.addChanges([]*ManifestChange{
+			newCreateChange(t.GetID(), 0),
+		})
+		errChan <- err
+	}(errChan)
 
 	ls.lv[0].addLevel0Table(t)
-
-	return nil
+	err := <-errChan
+	if err != nil {
+		go func() {
+			ls.lv[0].deleteLevel0Table()
+		}()
+	}
+	return err
 }
 
 func (lc *LevelsController) lastLevel() *Level {

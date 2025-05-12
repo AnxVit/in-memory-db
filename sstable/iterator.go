@@ -10,6 +10,7 @@ type currentNode struct {
 type Iterator struct {
 	tb      *SSTable
 	current *currentNode
+	entries []Entry
 }
 
 func (it *Iterator) Next() bool {
@@ -17,21 +18,29 @@ func (it *Iterator) Next() bool {
 		return false
 	}
 
-	if it.current.posIdx < len(it.tb.blockIndex[it.current.blockIdx].data) {
+	if it.current.posIdx < len(it.entries) {
 		it.current.posIdx += 1
-		entry := it.tb.blockIndex[it.current.blockIdx].data[it.current.posIdx]
+		entry := it.entries[it.current.posIdx]
 		it.current.key = entry.Key
 		it.current.value = entry.Value
 	} else {
+		var err error
 		if it.current.blockIdx == len(it.tb.blockIndex)-1 {
 			return false
 		}
 		it.current.blockIdx += 1
 		it.current.posIdx = 0
-		entry := it.tb.blockIndex[it.current.blockIdx].data[it.current.posIdx]
+		block := it.tb.blockIndex[it.current.blockIdx]
+		it.entries, err = it.tb.getEntriesFromBlock(block)
+		if err != nil {
+			// log
+			return false
+		}
+		entry := it.entries[it.current.posIdx]
 		it.current.key = entry.Key
 		it.current.value = entry.Value
 	}
+
 	return true
 }
 

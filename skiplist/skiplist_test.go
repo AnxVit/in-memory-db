@@ -51,7 +51,7 @@ func Test_MultiInsert(t *testing.T) {
 	})
 	for i := range 10 {
 		key := []byte(fmt.Sprintf("%d", i))
-		value := fmt.Sprintf("value%d", i)
+		value := []byte(fmt.Sprintf("value%d", i))
 		sl.Insert(key, value, nil)
 	}
 
@@ -95,7 +95,7 @@ func TestExpSkip(t *testing.T) {
 	})
 	key := []byte("key1")
 	value := []byte("value1")
-	upValue := "value2"
+	upValue := []byte("value2")
 	ttl := time.Second
 	sl.Insert(key, value, &ttl)
 

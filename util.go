@@ -1,11 +1,11 @@
-package main
+package db
 
 import (
-	"GoKeyValueWarehouse/levels/sstable"
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
-	"math"
+	"sync"
+	"time"
 )
 
 type Iterator interface {
@@ -16,14 +16,23 @@ type Iterator interface {
 	Value() interface{}
 	Valid() bool
 
-	// All iterators should be closed so that file garbage collection works.
 	Close() error
 }
 
-func serializeOp(key, value []byte) []byte {
-	var buf bytes.Buffer
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 4096))
+	},
+}
 
-	enc := gob.NewEncoder(&buf)
+func serializeOp(key, value []byte) []byte {
+	buf := bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		buf.Reset()
+		bufPool.Put(buf)
+	}()
+
+	enc := gob.NewEncoder(buf)
 
 	operation := Entry{
 		Key:   key,
@@ -37,21 +46,35 @@ func serializeOp(key, value []byte) []byte {
 
 	return buf.Bytes()
 }
-func KeyWithTs(key []byte, ts uint64) []byte {
+
+func desialaizeOp(data []byte) (Entry, error) {
+	buf := bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		buf.Reset()
+		bufPool.Put(buf)
+	}()
+	buf.Write(data)
+
+	dec := gob.NewDecoder(buf)
+
+	var operation Entry
+	err := dec.Decode(&operation)
+	if err != nil {
+		return Entry{}, err
+	}
+	return operation, nil
+}
+
+func KeyWithTs(key []byte) []byte {
 	out := make([]byte, len(key)+8)
 	copy(out, key)
-	binary.BigEndian.PutUint64(out[len(key):], math.MaxUint64-ts)
+	binary.BigEndian.PutUint64(out[len(key):], uint64(time.Now().UnixMicro()))
 	return out
 }
 
-// ParseTs parses the timestamp from the key bytes.
 func ParseTs(key []byte) uint64 {
 	if len(key) <= 8 {
 		return 0
 	}
-	return math.MaxUint64 - binary.BigEndian.Uint64(key[len(key)-8:])
-}
-
-func getEntryFromMemtable(mt *memtable) []sstable.Entry {
-	return []sstable.Entry{}
+	return binary.BigEndian.Uint64(key[len(key)-8:])
 }

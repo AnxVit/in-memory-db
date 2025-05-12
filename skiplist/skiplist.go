@@ -10,12 +10,13 @@ import (
 	"unsafe"
 )
 
+const TOMBSTONE = "$tombstone$"
+
 type Node struct {
-	key     []byte
-	value   interface{}
-	lv      *Levels
-	ttl     *time.Time
-	expired bool
+	key   []byte
+	value []byte
+	lv    *Levels
+	ttl   *time.Time
 }
 
 type Levels struct {
@@ -35,7 +36,7 @@ type SkipList struct {
 	mu        sync.RWMutex
 }
 
-func NewNode(level int, key []byte, value interface{}, ttl *time.Duration) *Node {
+func NewNode(level int, key, value []byte, ttl *time.Duration) *Node {
 	var expiration *time.Time
 	if ttl != nil {
 		exp := time.Now().Add(*ttl)
@@ -56,13 +57,7 @@ func (n *Node) Size() int {
 }
 
 func (n *Node) IsExpired() bool {
-	if n.ttl == nil {
-		return false
-	}
-	if n.expired {
-		return true
-	}
-	return time.Now().After(*n.ttl)
+	return n.ttl == nil
 }
 
 func NewSkipList(opt Options) *SkipList {
@@ -89,7 +84,7 @@ func (sl *SkipList) Copy() *SkipList {
 	it := NewIterator(sl)
 	for it.Next() {
 		key, value, ttl := it.Current()
-		if value != nil && ttl != nil {
+		if value != nil && !bytes.Equal(value, []byte(TOMBSTONE)) {
 			newSkipList.Insert(key, value, ttl)
 		}
 	}
@@ -104,14 +99,14 @@ func (sl *SkipList) randomLevel() int {
 	return level
 }
 
-func (sl *SkipList) Insert(key []byte, value interface{}, ttl *time.Duration) {
+func (sl *SkipList) Insert(key, value []byte, ttl *time.Duration) {
 	sl.mu.RLock()
 	defer sl.mu.RUnlock()
 	update := make([]*Node, sl.maxLevel+1)
 	current := sl.header
 
 	for i := sl.h; i >= 0; i-- {
-		for current.lv.nodes[i] != nil && (bytes.Compare(current.lv.nodes[i].key, key) < 0 || current.lv.nodes[i].expired) {
+		for current.lv.nodes[i] != nil && (bytes.Compare(current.lv.nodes[i].key, key) < 0 || bytes.Equal(current.lv.nodes[i].value, []byte(TOMBSTONE))) {
 			current = current.lv.nodes[i]
 		}
 		update[i] = current
@@ -125,7 +120,10 @@ func (sl *SkipList) Insert(key []byte, value interface{}, ttl *time.Duration) {
 		if ttl != nil {
 			if _, ok := sl.debouncer[string(key)]; !ok {
 				sl.debouncer[string(key)] = debounce.New(*ttl, func() {
-					current.expired = true
+					current.ttl = nil
+					sl.size -= current.Size()
+					current.value = []byte(TOMBSTONE)
+					sl.size += current.Size()
 				})
 			}
 			sl.debouncer[string(key)].Trigger()
@@ -136,7 +134,6 @@ func (sl *SkipList) Insert(key []byte, value interface{}, ttl *time.Duration) {
 				sl.debouncer[string(key)].Stop()
 			}
 		}
-		current.expired = false
 		sl.size += current.Size()
 		return
 	}
@@ -156,7 +153,6 @@ func (sl *SkipList) Insert(key []byte, value interface{}, ttl *time.Duration) {
 	}
 	if ttl != nil {
 		sl.debouncer[string(key)] = debounce.New(*ttl, func() {
-			newNode.expired = true
 		})
 		sl.debouncer[string(key)].Trigger()
 	}
@@ -170,14 +166,14 @@ func (sl *SkipList) Search(key []byte) (interface{}, bool) {
 	current := sl.header
 
 	for i := sl.h; i >= 0; i-- {
-		for current.lv.nodes[i] != nil && (bytes.Compare(current.lv.nodes[i].key, key) < 0 || current.lv.nodes[i].expired) {
+		for current.lv.nodes[i] != nil && (bytes.Compare(current.lv.nodes[i].key, key) < 0 || bytes.Equal(current.lv.nodes[i].value, []byte(TOMBSTONE))) {
 			current = current.lv.nodes[i]
 		}
 	}
 
 	current = current.lv.nodes[0]
 	if current != nil && bytes.Equal(current.key, key) {
-		if current.IsExpired() {
+		if current.IsExpired() || bytes.Equal(current.value, []byte(TOMBSTONE)) {
 			return nil, false
 		}
 		return current.value, true
@@ -202,7 +198,7 @@ func (sl *SkipList) Delete(key []byte) {
 	current := sl.header
 
 	for i := sl.h; i >= 0; i-- {
-		for current.lv.nodes[i] != nil && (bytes.Compare(current.lv.nodes[i].key, key) < 0 || current.lv.nodes[i].expired) {
+		for current.lv.nodes[i] != nil && (bytes.Compare(current.lv.nodes[i].key, key) < 0 || bytes.Equal(current.lv.nodes[i].value, []byte(TOMBSTONE))) {
 			current = current.lv.nodes[i]
 		}
 		update[i] = current

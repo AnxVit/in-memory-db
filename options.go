@@ -1,8 +1,8 @@
-package main
+package db
 
 import (
-	"GoKeyValueWarehouse/levels/sstable"
 	"GoKeyValueWarehouse/skiplist"
+	"GoKeyValueWarehouse/sstable"
 	"GoKeyValueWarehouse/wal"
 	"time"
 )
@@ -12,22 +12,29 @@ type Options struct {
 	WALOpt wal.Options
 
 	// memtable options
-	MemtableOpt  skiplist.Options
+	SkipListOpt  skiplist.Options
 	MemtableSize int64
+	NumImmutable int64
+	MemtableDir  string
 
-	// sstable options
+	// SSTable options
 	SSTableOpt          sstable.Options
 	TableSize           int64
 	TableSizeMultiplier int64
 
+	// Level Controller options
 	NumCompactors       int64
 	LevelSizeMultiplier int64
 	BaseLevelSize       int64
 	NumLevelZeroTables  int64
+	MaxLevels           int
 
-	MaxLevels int
+	// Manifest
+	ManifestDir string
 
 	Directory      string
 	LastCompaction time.Time
 	Compress       bool
+
+	maxRequestSize int64
 }

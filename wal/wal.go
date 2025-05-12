@@ -2,6 +2,8 @@ package wal
 
 import (
 	ringcache "GoKeyValueWarehouse/wal/ringCache"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -53,7 +55,15 @@ type bpos struct {
 	end int // one byte past pos
 }
 
-func Open(opts *Options) (*Log, error) {
+func (l *Log) GetFirstIndex() uint64 {
+	return l.firstIndex
+}
+
+func (l *Log) GetLastIndex() uint64 {
+	return l.lastIndex
+}
+
+func Open(opts *Options, dirPath string) (*Log, error) {
 	if opts == nil {
 		opts = DefaultOptions
 	}
@@ -70,7 +80,9 @@ func Open(opts *Options) (*Log, error) {
 		opts.FilePerms = DefaultOptions.FilePerms
 	}
 
-	path, err := filepath.Abs(opts.Directory)
+	path := filepath.Join(opts.Directory, dirPath)
+
+	path, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
 	}
@@ -126,20 +138,16 @@ func (l *Log) load() error {
 		l.sfile, err = os.OpenFile(l.segments[0].path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
 		return err
 	}
-	// Open existing log. Clean up log if START of END segments exists.
 	if startIdx != -1 {
 		if endIdx != -1 {
-			// There should not be a START and END at the same time
 			return ErrCorrupt
 		}
-		// Delete all files leading up to START
 		for i := 0; i < startIdx; i++ {
 			if err := os.Remove(l.segments[i].path); err != nil {
 				return err
 			}
 		}
 		l.segments = append([]*segment{}, l.segments[startIdx:]...)
-		// Rename the START segment
 		orgPath := l.segments[0].path
 		finalPath := orgPath[:len(orgPath)-len(".START")]
 		err := os.Rename(orgPath, finalPath)
@@ -149,7 +157,6 @@ func (l *Log) load() error {
 		l.segments[0].path = finalPath
 	}
 	if endIdx != -1 {
-		// Delete all files following END
 		for i := len(l.segments) - 1; i > endIdx; i-- {
 			if err := os.Remove(l.segments[i].path); err != nil {
 				return err
@@ -158,12 +165,10 @@ func (l *Log) load() error {
 		l.segments = append([]*segment{}, l.segments[:endIdx+1]...)
 		if len(l.segments) > 1 && l.segments[len(l.segments)-2].index ==
 			l.segments[len(l.segments)-1].index {
-			// remove the segment prior to the END segment because it shares
-			// the same starting index.
+
 			l.segments[len(l.segments)-2] = l.segments[len(l.segments)-1]
 			l.segments = l.segments[:len(l.segments)-1]
 		}
-		// Rename the END segment
 		orgPath := l.segments[len(l.segments)-1].path
 		finalPath := orgPath[:len(orgPath)-len(".END")]
 		err := os.Rename(orgPath, finalPath)
@@ -338,6 +343,62 @@ func (l *Log) Write(index uint64, data []byte) error {
 	l.wbatch.Clear()
 	l.wbatch.Write(index, data)
 	return l.writeBatch(&l.wbatch)
+}
+
+func (l *Log) Read(index uint64) (data []byte, err error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.closed {
+		return nil, ErrClosed
+	}
+	if index == 0 || index < l.firstIndex || index > l.lastIndex {
+		return nil, ErrNotFound
+	}
+	s, err := l.loadSegment(index)
+	if err != nil {
+		return nil, err
+	}
+	epos := s.epos[index-s.index]
+	edata := s.ebuf[epos.pos:epos.end]
+	if l.opts.LogFormat == JSON {
+		return readJSON(edata)
+	}
+	// binary read
+	size, n := binary.Uvarint(edata)
+	if n <= 0 {
+		return nil, ErrCorrupt
+	}
+	if uint64(len(edata)-n) < size {
+		return nil, ErrCorrupt
+	}
+	if l.opts.NoCopy {
+		data = edata[n : uint64(n)+size]
+	} else {
+		data = make([]byte, size)
+		copy(data, edata[n:])
+	}
+	return data, nil
+}
+
+func readJSON(edata []byte) ([]byte, error) {
+	var data []byte
+	s, err := findValue(edata, "data")
+	if err != nil {
+		return nil, err
+	}
+	if len(s) > 0 && s[0] == '$' {
+		var err error
+		data, err = base64.URLEncoding.DecodeString(s[1:])
+		if err != nil {
+			return nil, ErrCorrupt
+		}
+	} else if len(s) > 0 && s[0] == '+' {
+		data = make([]byte, len(s[1:]))
+		copy(data, s[1:])
+	} else {
+		return nil, ErrCorrupt
+	}
+	return data, nil
 }
 
 func (l *Log) Sync() error {

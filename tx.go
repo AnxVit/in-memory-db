@@ -1,17 +1,16 @@
-package main
+package db
 
 import (
 	"context"
-	"fmt"
 	"sync"
 )
 
 type Tranzaction struct {
 	db        *DB
-	id        int64    // Unique identifier for the transaction
-	entries   []*Entry // List of operations in the transaction
+	id        int64 // Unique identifier for the transaction
+	entries   []*Entry
 	operation []OPR_CODE
-	lock      *sync.RWMutex // The lock for the transaction
+	lock      *sync.RWMutex
 }
 
 func (db *DB) Begin(ctx context.Context) *Tranzaction {
@@ -36,7 +35,7 @@ func (txn *Tranzaction) AddOperation(op OPR_CODE, key, value []byte) {
 		return
 	}
 
-	entry := Entry{
+	entry := &Entry{
 		Key: key,
 	}
 
@@ -47,49 +46,19 @@ func (txn *Tranzaction) AddOperation(op OPR_CODE, key, value []byte) {
 		entry.Value = TOMBSTONE
 	}
 
-	txn.entries = append(txn.entries)
+	txn.entries = append(txn.entries, entry)
 	txn.operation = append(txn.operation, op)
 }
 
 func (txn *Tranzaction) Commit() error {
-	txn.db.memtableLock.Lock() // Makes the transaction atomic and serializable
-	defer txn.db.memtableLock.Unlock()
-
-	txn.lock.Lock()
-	defer txn.lock.Unlock()
-
-	for _, entry := range txn.entries {
-		txn.db.write(entry)
-	}
-
-	return nil
-}
-
-func (txn *Tranzaction) Rollback() error {
-	txn.lock.Lock()
-	defer txn.lock.Unlock()
-
 	txn.db.memtableLock.Lock()
 	defer txn.db.memtableLock.Unlock()
 
-	for i := len(txn.entries) - 1; i >= 0; i-- {
+	txn.lock.Lock()
+	defer txn.lock.Unlock()
 
-		op := txn.operation[i]
-		switch op {
-		case INSERT, UPDATE:
-			txn.db.write(&Entry{
-				Key:   txn.entries[i].Key,
-				Value: TOMBSTONE,
-			})
-		case DELETE:
-			// err := txn.db.appendToWALQueue(PUT, op.Key, nil)
-			// if err != nil {
-			// 	return err
-			// }
-			// txn.db.memtable.Insert(op.Key, op.Value, nil)
-		default:
-			return fmt.Errorf("invalid operation")
-		}
+	if err := txn.db.write(txn.entries); err != nil {
+		return err
 	}
 
 	return nil
