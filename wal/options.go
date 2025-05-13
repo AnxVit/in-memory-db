@@ -11,6 +11,4 @@ type Options struct {
 	DirPerms         os.FileMode
 	FilePerms        os.FileMode
 	Directory        string
-
-	MaxRingSize int64
 }

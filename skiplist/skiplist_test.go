@@ -9,8 +9,8 @@ import (
 func TestNewSkipList(t *testing.T) {
 	sl := NewSkipList(Options{
 		DeleteExpiredInterval: 1 * time.Second,
-		MemtableMaxLevel:      12,
-		MemtableP:             0.25,
+		MaxLevel:              12,
+		P:                     0.25,
 	})
 	if sl == nil {
 		t.Fatal("Expected new skip list to be created")
@@ -26,8 +26,8 @@ func TestNewSkipList(t *testing.T) {
 func TestInsertAndSearch(t *testing.T) {
 	sl := NewSkipList(Options{
 		DeleteExpiredInterval: 1 * time.Second,
-		MemtableMaxLevel:      12,
-		MemtableP:             0.25,
+		MaxLevel:              12,
+		P:                     0.25,
 	})
 	key := []byte("key1")
 	value := []byte("value1")
@@ -46,8 +46,8 @@ func TestInsertAndSearch(t *testing.T) {
 func Test_MultiInsert(t *testing.T) {
 	sl := NewSkipList(Options{
 		DeleteExpiredInterval: 1 * time.Second,
-		MemtableMaxLevel:      16,
-		MemtableP:             0.5,
+		MaxLevel:              16,
+		P:                     0.5,
 	})
 	for i := range 10 {
 		key := []byte(fmt.Sprintf("%d", i))
@@ -71,8 +71,8 @@ func Test_MultiInsert(t *testing.T) {
 func TestExp(t *testing.T) {
 	sl := NewSkipList(Options{
 		DeleteExpiredInterval: 1 * time.Second,
-		MemtableMaxLevel:      12,
-		MemtableP:             0.25,
+		MaxLevel:              12,
+		P:                     0.25,
 	})
 	key := []byte("key1")
 	value := []byte("value1")
@@ -90,8 +90,8 @@ func TestExp(t *testing.T) {
 func TestExpSkip(t *testing.T) {
 	sl := NewSkipList(Options{
 		DeleteExpiredInterval: 1 * time.Second,
-		MemtableMaxLevel:      12,
-		MemtableP:             0.25,
+		MaxLevel:              12,
+		P:                     0.25,
 	})
 	key := []byte("key1")
 	value := []byte("value1")

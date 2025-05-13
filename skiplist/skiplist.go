@@ -63,14 +63,16 @@ func (n *Node) IsExpired() bool {
 func NewSkipList(opt Options) *SkipList {
 	sk := &SkipList{
 		opt:       opt,
-		header:    NewNode(int(opt.MemtableMaxLevel), nil, nil, nil),
+		header:    NewNode(int(opt.MaxLevel), nil, nil, nil),
 		h:         0,
 		size:      0,
-		maxLevel:  int(opt.MemtableMaxLevel),
-		p:         opt.MemtableP,
+		maxLevel:  int(opt.MaxLevel),
+		p:         opt.P,
 		debouncer: make(map[string]*debounce.Debouncer),
 	}
-	go sk.worker(context.TODO())
+	if opt.DeleteExpired {
+		go sk.worker(context.TODO())
+	}
 
 	return sk
 }

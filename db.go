@@ -39,7 +39,7 @@ type DB struct {
 	flushQueue     []*memtable
 	flushQueueChan chan *memtable
 
-	transactionsLock *sync.RWMutex
+	transactionsLock *sync.Mutex
 	transactions     []*Tranzaction
 
 	isClosed atomic.Uint32
@@ -64,12 +64,13 @@ func Open(opts Options) (*DB, error) {
 
 		flushQueue: make([]*memtable, opts.NumImmutable),
 
-		transactionsLock: &sync.RWMutex{},
+		transactionsLock: &sync.Mutex{},
 		transactions:     make([]*Tranzaction, 0),
 
 		writeCh: make(chan *request, kvWriteChCapacity),
 		wg:      &sync.WaitGroup{},
 
+		lock: &sync.RWMutex{},
 		opt:  opts,
 		exit: make(chan struct{}),
 	}
@@ -114,29 +115,21 @@ func Open(opts Options) (*DB, error) {
 func (db *DB) close() error {
 	db.isClosed.Store(1)
 
-	if db.memtable.sl.Size() > 0 {
-		// db.appendMemtableToFlushQueue()
-	}
-
 	cancelComponents.Do()
-
 	close(db.exit)
 	close(db.writeCh)
-
 	db.wg.Wait()
 
-	// for _, sstable := range db.sstables {
-	// 	err := sstable.Close()
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// }
+	db.lc.close()
 	if db.memtable.wal != nil {
 		close(db.flushQueueChan)
 		err := db.memtable.wal.Close()
 		if err != nil {
 			return err
 		}
+	}
+	for _, mem := range db.flushQueue {
+		mem.wal.Close()
 	}
 
 	db.manifest.close()
@@ -339,7 +332,7 @@ func (db *DB) getMemTables() ([]*memtable, func()) {
 	}
 }
 
-func (db *DB) get(key []byte) (interface{}, error) {
+func (db *DB) Get(key []byte) (interface{}, error) {
 	if db.IsClosed() {
 		return nil, ErrorClosedDB
 	}
@@ -355,23 +348,17 @@ func (db *DB) get(key []byte) (interface{}, error) {
 	return db.lc.get(key)
 }
 
-var requestPool = sync.Pool{
-	New: func() interface{} {
-		return new(request)
-	},
-}
-
-func (db *DB) write(entries []*Entry) error {
-	var size int64
+func (db *DB) Write(entries []*Entry) error {
+	var size uint64
 	for _, e := range entries {
 		size += e.calculateSize()
 	}
-	if size >= db.opt.maxRequestSize {
+	if size >= db.opt.MaxRequestSize {
 		return ErrTooBig
 	}
-	req := requestPool.Get().(*request)
-	req.reset()
-	req.Entries = entries
+	req := &request{
+		Entries: entries,
+	}
 	db.writeCh <- req
 	return nil
 }

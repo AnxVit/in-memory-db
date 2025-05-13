@@ -3,8 +3,9 @@ package skiplist
 import "time"
 
 type Options struct {
-	DeleteExpiredInterval  time.Duration `json:"delete_expired_interval"`
-	MemtableMaxLevel       int64
-	MemtableP              float64
-	MemtableFlushThreshold int64
+	DeleteExpired         bool
+	DeleteExpiredInterval time.Duration `json:"delete_expired_interval"`
+	MaxLevel              int64
+	P                     float64
+	FlushThreshold        int64
 }

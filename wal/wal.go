@@ -221,27 +221,6 @@ func (l *Log) loadSegmentEntries(s *segment) error {
 	return nil
 }
 
-func (l *Log) FirstIndex() (index uint64, err error) {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	if l.closed {
-		return 0, ErrClosed
-	}
-	if l.lastIndex == 0 {
-		return 0, nil
-	}
-	return l.firstIndex, nil
-}
-
-func (l *Log) LastIndex() (index uint64, err error) {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	if l.closed {
-		return 0, ErrClosed
-	}
-	return l.lastIndex, nil
-}
-
 func (l *Log) WriteBatch(b *Batch) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()

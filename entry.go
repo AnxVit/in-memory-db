@@ -7,9 +7,9 @@ type Entry struct {
 	Value []byte
 }
 
-func (e *Entry) calculateSize() int64 {
-	k := int64(len(e.Key))
-	v := int64(len(e.Value))
+func (e *Entry) calculateSize() uint64 {
+	k := uint64(len(e.Key))
+	v := uint64(len(e.Value))
 	return k + v + 8
 }
 

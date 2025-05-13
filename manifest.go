@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -42,10 +43,6 @@ type ManifestInfo struct {
 	Deletions int64
 }
 
-func NewManifest(dir string) (*manifest, error) {
-	return openOrCreateManifest(dir)
-}
-
 type LevelManifest struct {
 	Tables map[uint64]struct{}
 }
@@ -60,10 +57,18 @@ type manifest struct {
 	manifestInfo ManifestInfo
 }
 
+func NewManifest(dir string) (*manifest, error) {
+	return openOrCreateManifest(dir)
+}
+
 func openOrCreateManifest(dir string) (*manifest, error) {
+	err := os.MkdirAll(dir, 0755)
+	if err != nil {
+		return nil, err
+	}
 	path := filepath.Join(dir, ManifestFilename)
 
-	fp, err := os.OpenFile(path, os.O_WRONLY, 0)
+	fp, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return nil, err
@@ -126,7 +131,7 @@ func ReplayManifestFile(fp *os.File) (ManifestInfo, int64, error) {
 		var lenCrcBuf [4]byte
 		_, err := io.ReadFull(&r, lenCrcBuf[:])
 		if err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			return ManifestInfo{}, 0, err
@@ -134,7 +139,7 @@ func ReplayManifestFile(fp *os.File) (ManifestInfo, int64, error) {
 		length := binary.BigEndian.Uint32(lenCrcBuf[0:4])
 		if length > uint32(stat.Size()) {
 			return ManifestInfo{}, 0, fmt.Errorf(
-				"buffer length: %d greater than file size: %d. manifest file might be corrupted",
+				"buffer length: %d greater than file size: %d",
 				length, stat.Size())
 		}
 		var buf = make([]byte, length)
@@ -160,9 +165,19 @@ func ReplayManifestFile(fp *os.File) (ManifestInfo, int64, error) {
 
 func helpRewrite(dir string, m *ManifestInfo) (*os.File, int, error) {
 	rewritePath := filepath.Join(dir, ManifestRewriteFilename)
-	fp, err := os.OpenFile(rewritePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	var (
+		fp  *os.File
+		err error
+	)
+	fp, err = os.OpenFile(rewritePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		return nil, 0, err
+		if !os.IsNotExist(err) {
+			return nil, 0, err
+		}
+		fp, err = os.Create(rewritePath)
+		if err != nil {
+			return nil, 0, err
+		}
 	}
 
 	buf := make([]byte, 8)
@@ -271,7 +286,6 @@ func applyManifestChange(build *ManifestInfo, tc *ManifestChange) error {
 }
 
 func (mf *manifest) rewrite() error {
-	// In Windows the files should be closed before doing a Rename.
 	if err := mf.file.Close(); err != nil {
 		return err
 	}
@@ -286,7 +300,7 @@ func (mf *manifest) rewrite() error {
 	return nil
 }
 
-func (mf *manifest) addChanges(changesParam []*ManifestChange) error {
+func (mf *manifest) AddChanges(changesParam []*ManifestChange) error {
 	changes := ManifestChangeSet{Changes: changesParam}
 	buf, err := json.Marshal(&changes)
 	if err != nil {

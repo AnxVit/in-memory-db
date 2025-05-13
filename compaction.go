@@ -1,7 +1,6 @@
 package db
 
 import (
-	"GoKeyValueWarehouse/skiplist"
 	"GoKeyValueWarehouse/sstable"
 	"bytes"
 	"sort"
@@ -81,7 +80,10 @@ func (cs *compactStatus) overlapsWith(level int, this KeyRange) bool {
 func (cs *compactStatus) delSize(l int) int64 {
 	cs.RLock()
 	defer cs.RUnlock()
-	return cs.levels[l].delSize
+	if len(cs.levels) > l {
+		return cs.levels[l].delSize
+	}
+	return 0
 }
 
 func (cs *compactStatus) delete(cd compactDef) {
@@ -246,20 +248,20 @@ func (lc *LevelsController) compactBuildTables(cd compactDef) ([]*sstable.SSTabl
 	}, nil
 }
 
-func (s *LevelsController) subcompact(it *sstable.MergeSSTableIterator, cd compactDef, res chan<- *sstable.SSTable) {
+func (lc *LevelsController) subcompact(it *sstable.MergeSSTableIterator, cd compactDef, res chan<- *sstable.SSTable) {
 	addKeys := func() {
 		for ; it.Vaild(); it.Next() {
-			if bytes.Equal(it.Value(),[]byte(skiplist.TOMBSTONE))
+			//if bytes.Equal(it.Value(),[]byte(skiplist.TOMBSTONE))
 		}
 	}
 	addKeys()
 	go func(fileID uint64) {
-		tbl, err := sstable.CreateTable(fileID, nil, s.db.opt.SSTableOpt)
+		tbl, err := sstable.CreateTable(fileID, nil, lc.db.opt.SSTableOpt)
 		if err != nil {
 			return
 		}
 		res <- tbl
-	}(s.getNextFileID())
+	}(lc.getNextFileID())
 }
 
 func SameKey(src, dst []byte) bool {

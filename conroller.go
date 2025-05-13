@@ -365,7 +365,7 @@ func (lc *LevelsController) runCompactDef(cd compactDef) (err error) {
 	}()
 	changeSet := buildChangeSet(&cd, newTables)
 
-	if err := lc.db.manifest.addChanges(changeSet.Changes); err != nil {
+	if err := lc.db.manifest.AddChanges(changeSet.Changes); err != nil {
 		return err
 	}
 
@@ -390,11 +390,6 @@ func (s *LevelsController) fillTables(cd *compactDef) bool {
 	}
 	// if cd.thisLevel.isLastLevel() {
 	// 	return s.fillMaxLevelTables(tables, cd)
-	// }
-	// if len(tables) == 0 || cd.nextLevel == nil {
-	// 	sort.Slice(tables, func(i, j int) bool {
-	// 		return tables[i].MaxVersion() < tables[j].MaxVersion()
-	// 	})
 	// }
 
 	for _, t := range tables {
@@ -484,7 +479,7 @@ func (lc *LevelsController) levelTargets() targets {
 func (ls *LevelsController) addLevel0Table(t *sstable.SSTable) error {
 	errChan := make(chan error)
 	go func(errChan chan<- error) {
-		err := ls.db.manifest.addChanges([]*ManifestChange{
+		err := ls.db.manifest.AddChanges([]*ManifestChange{
 			newCreateChange(t.GetID(), 0),
 		})
 		errChan <- err
@@ -509,6 +504,28 @@ func (lc *LevelsController) getNextFileID() uint64 {
 	return id - 1
 }
 
-func (lc *LevelsController) get(_ []byte) (interface{}, error) {
-	return nil, nil
+func (lc *LevelsController) get(key []byte) ([]byte, error) {
+	var maxVersion uint64
+	var maxValue []byte
+	for _, level := range lc.lv {
+		entry, vs, err := level.get(key)
+		if err != nil {
+			return nil, err
+		}
+		if entry.Value == nil {
+			continue
+		}
+		if maxVersion < vs {
+			maxVersion = vs
+			maxValue = entry.Value
+		}
+	}
+
+	return maxValue, nil
+}
+
+func (lc *LevelsController) close() {
+	for _, level := range lc.lv {
+		level.close()
+	}
 }

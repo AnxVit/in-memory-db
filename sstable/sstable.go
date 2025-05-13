@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -38,7 +39,7 @@ type SSTable struct {
 	File *os.File
 	data []byte
 
-	// ref atomic.Int32 // For file garbage collection
+	ref atomic.Int32
 
 	// index
 	blockIndex        []BlockIndex
@@ -98,6 +99,7 @@ func CreateTable(id uint64, iter MIterator, opt Options) (*SSTable, error) {
 		opt:        opt,
 		File:       file,
 		id:         id,
+		ref:        atomic.Int32{},
 		CreatedAt:  createdTime,
 		blockCache: cache,
 		filter:     adaptivefilter.NewScalableCuckooFilter(),
@@ -279,15 +281,12 @@ func (sst *SSTable) buildIndex(out <-chan BlockIndex) {
 
 func (sst *SSTable) Close() error {
 	sst.wg.Wait()
-	fileName := sst.File.Name()
 
+	sst.File.Sync()
 	if err := sst.File.Close(); err != nil {
 		return err
 	}
 
-	if err := os.Remove(fileName); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -340,44 +339,6 @@ func (sst *SSTable) getEntriesFromBlock(block BlockIndex) ([]Entry, error) {
 	}
 
 	return entries, nil
-}
-
-func (sst *SSTable) Search(key []byte) (*Entry, error) {
-	var (
-		block BlockIndex
-		ok    bool
-	)
-	for i := 0; i < len(sst.blockIndex); i++ {
-		if bytes.Compare(sst.blockIndex[i].smallest, key) <= 0 && bytes.Compare(sst.blockIndex[i].biggest, key) >= 0 {
-			ok = true
-			block = sst.blockIndex[i]
-			break
-		}
-	}
-	if ok {
-		sst.muCache.RLock()
-		if entries, ok := sst.blockCache.Get(block.offset); ok {
-			sst.muCache.RUnlock()
-			for _, entry := range entries {
-				if bytes.Equal(key, entry.Key) {
-					return &entry, nil
-				}
-			}
-		} else {
-			go func() {
-				sst.muCache.Lock()
-				defer sst.muCache.Unlock()
-				entries, err := sst.getEntriesFromBlock(block)
-				if err != nil {
-					return
-				}
-				sst.blockCache.Add(block.offset, entries)
-			}()
-		}
-
-		return sst.searchInBlock(key, block)
-	}
-	return nil, errors.New("not found key in sst")
 }
 
 func (sst *SSTable) searchInBlock(targetKey []byte, block BlockIndex) (*Entry, error) {

@@ -4,18 +4,18 @@ import (
 	"GoKeyValueWarehouse/skiplist"
 	"GoKeyValueWarehouse/sstable"
 	"GoKeyValueWarehouse/wal"
-	"time"
 )
 
 type Options struct {
 	// WAL options
 	WALOpt wal.Options
 
-	// memtable options
-	SkipListOpt  skiplist.Options
+	// SkipList options
+	SkipListOpt skiplist.Options
+
+	// Memtable options
 	MemtableSize int64
 	NumImmutable int64
-	MemtableDir  string
 
 	// SSTable options
 	SSTableOpt          sstable.Options
@@ -32,9 +32,7 @@ type Options struct {
 	// Manifest
 	ManifestDir string
 
-	Directory      string
-	LastCompaction time.Time
-	Compress       bool
+	Directory string
 
-	maxRequestSize int64
+	MaxRequestSize uint64
 }

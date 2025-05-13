@@ -23,7 +23,13 @@ type memtable struct {
 func (db *DB) openMemtables() error {
 	dirs, err := os.ReadDir(db.opt.WALOpt.Directory)
 	if err != nil {
-		return errors.WithMessagef(err, "unable to open mem dir: %s", db.opt.WALOpt.Directory)
+		if !os.IsNotExist(err) {
+			return errors.WithMessagef(err, "unable to open mem dir: %s", db.opt.WALOpt.Directory)
+		}
+	}
+
+	if len(dirs) == 0 {
+		return nil
 	}
 
 	var fids []int
@@ -86,7 +92,6 @@ func (mt *memtable) SyncWAL() error {
 }
 
 func (mt *memtable) Put(entry *Entry) error {
-	entry.Key = KeyWithTs(entry.Key)
 	if mt.wal != nil {
 		data := serializeOp(entry.Key, entry.Value)
 		if err := mt.wal.Write(mt.index, data); err != nil {
@@ -100,7 +105,7 @@ func (mt *memtable) Put(entry *Entry) error {
 }
 
 func (mt *memtable) isFull() bool {
-	return mt.sl.Size() > int(mt.opt.SkipListOpt.MemtableFlushThreshold)
+	return mt.sl.Size() > int(mt.opt.SkipListOpt.FlushThreshold)
 }
 
 func (mt *memtable) UpdateSkipList() error {

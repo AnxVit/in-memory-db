@@ -7,5 +7,5 @@ var (
 
 	ErrorsWait = errors.New("wait for flush memtabel")
 
-	ErrTooBig = errors.New("bif request size")
+	ErrTooBig = errors.New("big request size")
 )

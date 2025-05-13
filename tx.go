@@ -57,7 +57,7 @@ func (txn *Tranzaction) Commit() error {
 	txn.lock.Lock()
 	defer txn.lock.Unlock()
 
-	if err := txn.db.write(txn.entries); err != nil {
+	if err := txn.db.Write(txn.entries); err != nil {
 		return err
 	}
 
